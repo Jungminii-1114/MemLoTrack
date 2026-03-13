@@ -29,3 +29,4 @@ particularly beneficial for processing high-resolution images or large batch-siz
 # Related Works
 * [LoRA fine-tuning Hyperparameters Guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide)
 * [DINOv2 official Github](https://github.com/facebookresearch/dinov2)
+* [Implementing LoRA from Scratch](https://medium.com/data-science/implementing-lora-from-scratch-20f838b046f1)
