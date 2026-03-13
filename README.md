@@ -1,4 +1,13 @@
-## LoRA Hyperparameters & Recommendations:
+### `MemEffAttention` Module in DINOv2
+An optimized implementatino of self-attention mechanism designed for memory efficiency.
+particularly beneficial for processing high-resolution images or large batch-size in Computer Vision Tasks.
+
+>### Key Features and Requiremenets
+>- **Memroy Optimization** : The primary purpose of `MemEffAttention` is to reduce the memory footprint compared to standard attention moduels. It achieves this by not materializing the full attention matrix during computation, instead calculating the output more efficiently. ** This makes DINOv2 models capable of handling larger input data, like those in depth estimation or semantic segmentation tasks, with less VRAM usage.**
+>- **xFormers Dependency** : The module relies on the highly optimized xFormers library to function. The DINOv2 codebase and projects that inherit from it, such as Depth Anything V2, integrate this module conditionall
+>- **Attentio Map Visualization Limitation** : As `MemEffAttention` avoids explicitly computing the full attention matrix, It doesn't easily allow for the extraction and visualization of attnetion heatmaps, which is a common technique for interpreting model behavior (e.g., saliency maps)<br> To visualize attention, developers must switch to the standard Attention module implementation within the DINOv2 framework, which does produce the intermediate attention matrix.
+
+### LoRA Hyperparameters & Recommendations:
 
 | Hyperparameter | Function | Recommended Settings |
 |--- |--- | --- |
