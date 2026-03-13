@@ -9,4 +9,4 @@
 | **Warmup Steps** | Gradually increases the learning rate at the start of training. | 5-10% of total steps |
 | **Scheduler Type** | Adjust the learning rate dynamically during training | `linear` or `cosine` |
 | **Seed (`random_state`)** | A fixed number to ensure reproducibility of results. | Any integer (e.g., `42`, `3407`) |
-| **__Target Modules__** | Specify which parts of the model you want to apply LoRA adapters to -- either the attention, the MLP, or both. <br> Attention : `q_proj, k_proj, v_proj. o_proj`<br>MLP : `gate_proj, up_proj, down_proj` | Recommended to target all major linear layers : `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`.|
+| **__Target Modules__** | Specify which parts of the model you want to apply LoRA adapters to -- either the attention, the MLP, or both. <br> Attention : `q_proj, k_proj, v_proj. o_proj`<br>MLP : `gate_proj, up_proj, down_proj` | Recommended to target all major linear layers : `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`. <br><br>(⚠️CAUTION⚠️ `q_proj`, `v_proj`, `gate_proj`를 넣는게 아닌, 직접 모델에서 추출해서 layer이름을 확인하고, 그에 맞춰서 넣어야 합니다.)|
