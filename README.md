@@ -19,3 +19,13 @@ particularly beneficial for processing high-resolution images or large batch-siz
 | **Scheduler Type** | Adjust the learning rate dynamically during training | `linear` or `cosine` |
 | **Seed (`random_state`)** | A fixed number to ensure reproducibility of results. | Any integer (e.g., `42`, `3407`) |
 | **__Target Modules__** | Specify which parts(layer) of the model you want to apply LoRA adapters to -- either the attention, the MLP, or both. <br> Attention : `q_proj, k_proj, v_proj. o_proj`<br>MLP : `gate_proj, up_proj, down_proj` | Recommended to target all major linear layers : `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`. <br><br>(⚠️CAUTION⚠️ `q_proj`, `v_proj`, `gate_proj`를 넣는게 아닌, 직접 모델에서 추출해서 layer이름을 확인하고, 그에 맞춰서 넣어야 합니다.)|
+
+# References
+* [MemLoTrack : Enhancing TIR Anti-UAV Tracking with Memory-Integrated Low-Rank Adaptation](https://www.mdpi.com/1424-8220/25/23/7359)
+* [LoRA : Low-Rank Adaptation of Large Language Models](https://arxiv.org/pdf/2106.09685)
+* [Tracking Meets LoRA : Faster Training, Larger Model, Stronger Performance](https://arxiv.org/pdf/2403.05231)
+
+
+# Related Works
+* [LoRA fine-tuning Hyperparameters Guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide)
+* [DINOv2 official Github](https://github.com/facebookresearch/dinov2)
