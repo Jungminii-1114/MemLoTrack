@@ -2,13 +2,14 @@ import cv2
 import numpy as np
 import torch
 import random
+import math
 import json
 import os
 import torch.nn as nn
 
 
 '''
-Search Region = Template * search_factor (generally, 4)
+Search Region = Template * search_factor (generally, 4) -> 4배를 하는게 면적이 4배, 가로 / 세로는 각 두 배씩 
 s_search = s x search_factor
 
 def temp_and_search와 같이 단순 crop하면 
@@ -17,16 +18,21 @@ object aspect ratio가 변하면서 context가 불안정해짐.
 
 '''
 ##################################################################
-12, March, To-do List
 
-1. Data Folder -> Import IR_label.json -> Find Bounding Box in first frame.
-2. ** (Vis) BBox --(input)-> Template/Search Region Cropping
-3. Cropped SR & T  --(input)--> Linear Projection (DINOv2)
-4. ** Token Type Embedding : Template / Serach / Memory (Not to include the first frame.)
-    5.1 Memory Token --> Memory Attention Layer
-    5.2 Search / Template -> Transformer Encoder
+`MemEffAttention` Module in DINOv2 : An optimized implementation of self-attention mechanism designed for memory efficiency.
+particularly beneficial for precessing high-resolution images or large batch sizes in CV Tasks.
 
-    6. Modeling Transformer Encoder & MAL
+Key Features and Requirements
+- Memory Optimization 
+: The primary purpose of `MemEffAttention` is to reduce the memory footprint compared to standard attention moduels. It achieves this by not materializing the full attention matrix during computation, instead calculating 
+the output more efficiently. This makes DINOv2 models capable of handling larger inputs, like those in depth estimation or semantic segmentation tasks, with less VRAM usage.
+
+
+- xFormers Dependency
+
+- Attnetion Map Visualization Limitation 
+: As `MemEffAttention` avoids explicitly computing the full attention matrix, It doesn't easily allow for the extraction and visualization of attention heatmaps, which is a common technique for interpreting model behavior (e.g., saliency maps)
+To Visualize attention, developers must switch to the standard Attnetion module implementation within the DINOv2 framework, which does produce the intermediate attnetino matrix.
 
 ##################################################################
 '''
@@ -43,22 +49,163 @@ import torchvision.models as models
 dinov2_vitb14_reg = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
 backbone = dinov2_vitb14_reg
 
+LoRAConfig={
+    "r" : 64,
+    "lora_alpha" : 8,
+    "lora_dropout":0.06,
+    "bias" : "none",
+    "target_modules":["qkv", "fc1", "fc2"]
+}
 
 class DINOv2(nn.Module):
-    def __init__(self):
+    def __init__(self, type_embedder, config):
         super().__init__()
         
         self.backbone = backbone
         for param in backbone.parameters():
             param.requires_grad = False  # Backbone Freezing
 
-    def forward(self, x):
-        feats = self.backbone.forward_features(x)
-        tokens=feats['x_norm_patchtokens'] # PatchEmbedding, [B, N, C]
+        self.type_embedder = type_embedder
+        self.config = config
 
-        return tokens
-    
+        for block in self.backbone.blocks:
+
+            original_qkv = block.attn.qkv
+            block.attn.qkv = LoRALinear(original_qkv, config=self.config)
+
+            original_fc1 = block.mlp.fc1
+            block.mlp.fc1 = LoRALinear(original_fc1, config=self.config)
+
+            original_fc2 = block.mlp.fc2
+            block.mlp.fc2 = LoRALinear(original_fc2, config=self.config)
+
+    def get_initial_tokens(self, x):
+        # Patch embedding
+        tokens = self.backbone.patch_embed(x)
         
+        # Positional Embeding
+        pos_embed = self.backbone.pos_embed[:, 1:, :]
+        return tokens + pos_embed
+
+    def forward(self, z_img, x_img, target_mask):
+        z_tokens = self.get_initial_tokens(z_img) # [B, 64, 768]
+        x_tokens = self.get_initial_tokens(x_img) # [B, 256, 768] 
+
+        z_tokens = self.type_embedder(z_tokens, token_type = 'template', target_mask = target_mask) 
+        x_tokens = self.type_embedder(x_tokens, token_type = "search")
+
+        tokens_concaten = torch.concat([z_tokens, x_tokens], dim=1)
+
+        for block in self.backbone.blocks: # Transformer Encoder (12 layers)
+            tokens_concaten = block(tokens_concaten)
+        tokens_concaten = self.backbone.norm(tokens_concaten)
+        
+        search_token_enc = tokens_concaten[:, 64:, :] # Search만 빼오기
+
+        return search_token_enc
+
+
+class LoRALinear(nn.Module):
+    # LORA Adapter는 Trainable하게 !! 
+    def __init__(self, original_layer, config):
+        super().__init__()
+        #self.original_qkv = original_qkv
+        self.config = config
+
+        self.original_layer = original_layer
+        self.rank = config['r']
+        self.lora_alpha = config['lora_alpha']
+        self.lora_dropout = nn.Dropout(config['lora_dropout'])
+        self.bias = config['bias']
+        self.target_modules = config['target_modules']
+        self.scaling = self.alpha / self.rank
+
+        in_features = self.original_layer.in_features
+        out_features = self.original_layer.out_features
+
+        self.LoRA_A = nn.Parameter(torch.zeros(in_features, self.rank))
+        self.LoRA_B = nn.Parameter(torch.randn(self.rank, out_features))
+
+        nn.init.kaiming_uniform_(self.LoRA_A, a=math.sqrt(5))
+        nn.init.zeros_(self.LoRA_B)
+
+    def forward(self, original_layer, x):
+        if original_layer == "original_qkv":
+            # LORA Adapter 적용된 qkv 계산
+            self.original_qkv = original_layer
+        elif original_layer == "original_fc1":
+            self.original_fc1 = original_layer
+        elif original_layer == "original_fc2":
+            self.original_fc2 = original_layer
+
+        original_output = self.original_layer(x)
+        LoRA_output = torch.matmul(torch.matmul(x, self.LoRA_A), self.LoRA_B) * self.scaling
+        
+        return original_output + LoRA_output
+
+
+
+
+'''
+Model Head
+|
+|___ Classification MLP
+|           |____ Role : 각 셀에 타겟 있을 확률 confidence 계산
+|           |____ Role : 어떤 상자가 진짜 타겟 상자인가 (최댓값)
+|           |____ Role : 최댓값의 셀에 Regression MLP의 거리 값을 이용해 BB 생성
+|___ Regression MLP
+|           |____ Role : 각 셀의 중심을 기준으로 4방향 거리 계산 
+|           |____ Role : Kalman Filter 예측으로 자연스러운지 Consistency 계산
+
+
+'''
+
+class PredictionHead(nn.Module): # [Batch, 768, 16, 16] -> [Batch, 192, 16, 16]
+    def __init__(self, in_channels=768, hidden_channels=192): # 256으로도 해보기
+        super().__init__()
+        self.ClassificationMLP = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1), # [B, 192, 16, 16] => [B, 1, 16, 16] 1채널만 필요함 (점수값)
+            nn.Softmax()
+        )
+
+        self.RegressionMLP = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+        self.offset_branch = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1)
+        )
+
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1) # [B, 256, 768] -> [B, 768, 256]
+        B, N, C=x.shape
+        x = x.view(B, 768, 16, 16) # [B, 768, 256] -> [B, 768, 16, 16]
+
+        score_map = self.ClassificationMLP(x)
+        size_map = self.RegressionMLP(x)
+        offset_map = self.offset_branch(x)
+
+        return score_map, size_map, offset_map
+
+class KalmanGate(object):
+    # 1. 드론의 현재 상태 벡터로 정의 ->6차원 벡터 
+    # 2. Prediction Head가 측정한 z_t
+
+
 class MemoryBank: # Only During Inference
     def __init__(self, max_size=7):
         self.max_size = max_size
@@ -67,6 +214,10 @@ class MemoryBank: # Only During Inference
         memory = []
 
         # Dual Gate 필요
+        # (1) Confidence Score : using maximum score 
+
+
+        # (2) Motion consistency : Kalman-based Mahalanobis test
 
         memory.append(tokens)
         # remove 로 제일 첫 번째 요소를 없애기 
@@ -99,16 +250,6 @@ class MemorySampling(nn.Module): # Only During Training
 
         return sampled_memory
 
-
-'''
-- Positional Embedding  (CLS Token X)
-- Type Embedding (Template / Search / Memory)
-- memory token = token + memory_type_embedding
-- **Final Memory Token = Patch_embedding (DINOv2) + Positional Embedding (DINOv2)
-- Save into Memory Bank
-
-
-'''
 class TypeEmbedding(nn.Module):
     # Input Type and shape of memory tokens in current step.
     def __init__(self, embed_dim=768):
@@ -130,26 +271,38 @@ class TypeEmbedding(nn.Module):
             return x + self.template_token
             # 수정 필요함
 
+class MAL(nn.Module):
+    def __init__(self, embed_dim = 768, num_heads=12):
+        super().__init__()
+        self.cross_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.MLP = nn.Sequential( # Ordinary Transformer's MLP (FFN) : embed_dim * 4
+            nn.Linear(embed_dim, embed_dim*4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+    def forward(self, search_token, memory_token):
+        if memory_token is None or memory_token.size(1) == 0: # First frame : just return
+            return search_token
+        
+        attention_output, _ = self.cross_attention(query = search_token, key=memory_token, value = memory_token)
+        x = self.norm(search_token + attention_output) # Serach token이 Encoder에서 나온거
+        MLP_output = self.MLP(x)
+        final_ouptut = self.norm2(x + MLP_output)
 
+        return final_ouptut
 
-#class MAL:
-
-
-class KalmanGate(object):
 
 
 class TrackerDINOv2(object):
-    def __init__(self, backbone):
+    def __init__(self):
         super().__init__()
 
-        self.model = backbone
+        self.net = DINOv2()
         self.template = None
         self.memory_bank = []
 
-
-    def parse_args(self):
-        pass
-    
     def initialize_tracking(self):
         pass
 
@@ -160,23 +313,28 @@ class TrackerDINOv2(object):
         self.template = self.extract_template(frame, bbox)
         self.prev_bbox = bbox
 
-    def update(self, frame):
-        search = self.extract_search(frame, self.prev_bbox)
-        
-        # Feature extraction 
-        # transformer
-        # bbox prediction  
+    def extract_template(self, frame, bbox):
+        x, y, w, h = bbox
+        cx = x + w / 2
+        cy = y + h / 2
+        s_z = SiamFC_crop_size(w, h)
+        template = self.SiamFC_crop(frame, cx, cy, s_z, 112)
 
+        template = self.transform(template).unsqueeze(0)
 
-        self.prev_bbox = pred_bbox
+        return template
 
-        return pred_bbox
+    def extract_search(self, frame, prev_bbox):
+        x, y, w, h = self.prev_bbox
+        cx = x + w / 2
+        cy = y + h / 2
 
-    # def _crop_and_resize(self):
-    #     pass
+        s_z = SiamFC_crop_size(w, h, context=0.5)
+        s_x = s_z * 2.0 # 2배 해서 면적 4배
 
-    def extract_search(self):
-        pass
+        patch = self.SiamFC_crop(frame, cx, cy, s_x, out_size=224)
+        search_tensor = self.transform(patch).unsqueeze(0)
+        return search_tensor
 
     def SiamFC_crop(self, img, cx, cy, size, out_size):
         # Tracking에서 사용할 template / Search patch를 이미지에서 추출
@@ -192,27 +350,6 @@ class TrackerDINOv2(object):
 
         return patch
 
-    def extract_template(self, frame, bbox):
-        x, y, w, h = bbox
-        cx = x + w / 2
-        cy = y + h / 2
-        s_z = SiamFC_crop_size(w, h)
-        template = self.SiamFC_crop(frame, cx, cy, s_z, 112)
-
-        return template
-
-
-
-
-
-
-
-
-
-
-
-
-
 def SiamFC_crop_size(w, h, context=0.5):
     p = (w + h) / 2 * context # contect padding : 배경 정보를 얻기 위함이며, appearance와 scale 변화에 강해지기 위해
     s = np.sqrt((w+p) * (h+p))
@@ -222,21 +359,20 @@ def SiamFC_crop_size(w, h, context=0.5):
 
     return s
 
-template_size_siam = SiamFC_crop_size(w, h)
-search_region_siam = template_size_siam * 4
-
-def SiamFC_PatchExtract(frame, bbox):
-    
-    SiamFC_crop_size()
-    pass
-
 
 
 def not_exist(pred):
     return (len(pred) == 1 and pred[0] == 0) or (len(pred) == 0)
 
-def get_bbox(label_res):
-    measure_per_frame = []
-    for _gt, _exist in zip(label_res['gt_rect'], label_res['exist']):
-        # Target 존재 x : _exist==False | Target 존재 O : _exist == True
-        measure_per_frame.append(not_exist(_pred) if not _exist else)
+# def get_bbox(label_res):
+#     measure_per_frame = []
+#     for _gt, _exist in zip(label_res['gt_rect'], label_res['exist']):
+#         # Target 존재 x : _exist==False | Target 존재 O : _exist == True
+#         measure_per_frame.append(not_exist(_pred) if not _exist else)
+
+def get_initial_bbox(json_file_path):
+    with open(json_file_path, "r") as f:
+        label = json.load(f)
+
+    first_bbox = label['gt_rect'][0]
+    return first_bbox
