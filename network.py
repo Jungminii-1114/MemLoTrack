@@ -160,6 +160,43 @@ Model Head
 
 '''
 
+def generate_gaussian_target(size=16, center=(7, 3), sigma=2.0):
+    cx, cy = center
+
+    result = torch.zeros((size, size), dtype=torch.float32)
+
+    for i in range(size):
+        for j in range(size):
+            
+            dist_sq = (i - cx) ** 2 + (j - cy) ** 2
+            result[i, j] = math.exp(-dist_sq / (2 * 1.5**2))
+
+    return result
+
+class TargetGenerateor(object):
+    def __init__(self, json_file):
+        super().__init__()
+        with open(json_file, "r") as f:
+            label = json.load(f)
+        
+        self.exist = label['exist']
+        self.gt_rect = label['gt_rect']
+        self.total_frames = len(label['exist'])
+
+    def get_target(self, frame):
+        if self.exist[frame] == 0:
+            return torch.zeors((16, 16))
+        x, y, w, h = self.gt_rect[frame]
+        cx = x + w/2
+        cy = y + h/2
+
+        grid_cx = int(cx/14)
+        grid_cy = int(cy/14)
+        target_heatmap = generate_gaussian_target(heatmap_size=16, center=(grid_cx, grid_cy), sigma=1.5)
+        return target_heatmap
+
+
+
 class PredictionHead(nn.Module): # [Batch, 768, 16, 16] -> [Batch, 192, 16, 16]
     def __init__(self, in_channels=768, hidden_channels=192): # 256으로도 해보기
         super().__init__()
@@ -169,7 +206,7 @@ class PredictionHead(nn.Module): # [Batch, 768, 16, 16] -> [Batch, 192, 16, 16]
             nn.ReLU(inplace=True),
             
             nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1), # [B, 192, 16, 16] => [B, 1, 16, 16] 1채널만 필요함 (점수값)
-            nn.Softmax()
+            nn.Sigmoid()
         )
 
         self.RegressionMLP = nn.Sequential(
@@ -181,25 +218,16 @@ class PredictionHead(nn.Module): # [Batch, 768, 16, 16] -> [Batch, 192, 16, 16]
             nn.ReLU(inplace=True)
         )
 
-        self.offset_branch = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1)
-        )
-
-
     def forward(self, x):
         x = x.permute(0, 2, 1) # [B, 256, 768] -> [B, 768, 256]
         B, N, C=x.shape
-        x = x.view(B, 768, 16, 16) # [B, 768, 256] -> [B, 768, 16, 16]
+        x = x.contiguous().view(B, 768, 16, 16) # [B, 768, 256] -> [B, 768, 16, 16]
 
-        score_map = self.ClassificationMLP(x)
-        size_map = self.RegressionMLP(x)
-        offset_map = self.offset_branch(x)
+        score_map = self.ClassificationMLP(x) # Output
+        size_map = self.RegressionMLP(x) 
 
-        return score_map, size_map, offset_map
+
+        return score_map, size_map
 
 class KalmanGate(object):
     # 1. 드론의 현재 상태 벡터로 정의 ->6차원 벡터 
@@ -209,10 +237,9 @@ class KalmanGate(object):
 class MemoryBank: # Only During Inference
     def __init__(self, max_size=7):
         self.max_size = max_size
+        self.memory= []
 
-    def add(self, tokens):
-        memory = []
-
+    def add(self, tokens, confidence_score):
         # Dual Gate 필요
         # (1) Confidence Score : using maximum score 
 
@@ -350,6 +377,7 @@ class TrackerDINOv2(object):
 
         return patch
 
+
 def SiamFC_crop_size(w, h, context=0.5):
     p = (w + h) / 2 * context # contect padding : 배경 정보를 얻기 위함이며, appearance와 scale 변화에 강해지기 위해
     s = np.sqrt((w+p) * (h+p))
@@ -364,15 +392,16 @@ def SiamFC_crop_size(w, h, context=0.5):
 def not_exist(pred):
     return (len(pred) == 1 and pred[0] == 0) or (len(pred) == 0)
 
-# def get_bbox(label_res):
-#     measure_per_frame = []
-#     for _gt, _exist in zip(label_res['gt_rect'], label_res['exist']):
-#         # Target 존재 x : _exist==False | Target 존재 O : _exist == True
-#         measure_per_frame.append(not_exist(_pred) if not _exist else)
+def get_bbox(label_res):
+    measure_per_frame = []
+    for _gt, _exist in zip(label_res['gt_rect'], label_res['exist']):
+        # Target 존재 x : _exist==False | Target 존재 O : _exist == True
+        measure_per_frame.append(not_exist(_pred) if not _exist else)
 
 def get_initial_bbox(json_file_path):
     with open(json_file_path, "r") as f:
         label = json.load(f)
+    
 
     first_bbox = label['gt_rect'][0]
     return first_bbox
