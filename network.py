@@ -43,6 +43,7 @@ To Visualize attention, developers must switch to the standard Attnetion module 
 USER_PATH = os.path.expanduser("~")
 
 ROOT_DIR = os.path.join(USER_PATH, "ai_study/CVIP/Anti-UAV/MemLoTrack", "Anti-UAV410")
+#ROOT_DIR = "/content/drive/MyDrive/Colab Notebooks/CVIP_LAB/UAV/MemLoTrack"
 
 
 import torch
@@ -139,10 +140,16 @@ class LoRALinear(nn.Module):
     # LORA Adapter는 Trainable하게 !! 
     def __init__(self, original_layer, config):
         super().__init__()
+
+        if isinstance(original_layer, LoRALinear):
+            original_layer = original_layer.original_layer
+
         #self.original_qkv = original_qkv
         self.config = config
 
         self.original_layer = original_layer
+        self.in_features = original_layer.in_features
+        self.out_features = original_layer.out_features
         self.rank = config['r']
         self.lora_alpha = config['lora_alpha']
         self.lora_dropout = nn.Dropout(config['lora_dropout'])
