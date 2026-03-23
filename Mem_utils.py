@@ -2,8 +2,6 @@ import cv2
 import numpy as np
 from typing import Dict, List, Tuple
 
-
-
 def extract_template(frame, bbox, transform):
     x, y, w, h = bbox
     cx = x + w / 2.0
