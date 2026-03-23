@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 import numpy as np
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Dict, Tuple
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
@@ -195,7 +196,8 @@ def reg_target(gt_bbox: List[float], stride: int=14, grid: int=16):
 def train(model:DINOv2, loader:DataLoader, optimizer:torch.optim.Optimizer, device:torch.device, cfg:TrainConfig):
     model.train()
     bce = nn.BCELoss()
-    l1 = nn.SmoothL1Loss()
+    # [deactivated] reduction='mean' 이라 스칼라가 되어 cls_tgt와 위치별 가중이 깨짐 → F.smooth_l1_loss(..., reduction="none") 사용
+    # l1 = nn.SmoothL1Loss()
 
     total_loss = 0.0
     steps = 0
@@ -244,7 +246,9 @@ def train(model:DINOv2, loader:DataLoader, optimizer:torch.optim.Optimizer, devi
         score_map, reg_map = model(z_img, x_img, target_mask, memory_kv=mem_tokens)
 
         loss_cls = bce(score_map, cls_tgt)
-        loss_reg = (l1(reg_map, reg_tgt) * cls_tgt).mean()
+        reg_err = F.smooth_l1_loss(reg_map, reg_tgt, reduction="none", beta=1.0)
+        loss_reg = (reg_err * cls_tgt).sum() / (cls_tgt.sum() * reg_map.shape[1] + 1e-6)
+        # [deactivated] loss_reg = (l1(reg_map, reg_tgt) * cls_tgt).mean()
         loss = loss_cls + 5.0 * loss_reg 
 
         optimizer.zero_grad()
@@ -274,11 +278,33 @@ def calculate_iou(box1: List[float], box2: List[float]) -> float:
     iou = inter_area / (b1_area + b2_area - inter_area + 1e-6)
     return float(iou)
 
+def decode_bbox_in_search_crop(
+    reg_map: torch.Tensor,
+    max_y: int,
+    max_x: int,
+    stride: float = 14.0,
+    search_size: float = 224.0,
+    min_wh: float = 2.0,
+) -> Tuple[float, float, float, float]:
+    """
+    argmax 셀의 l,t,r,b (stride 정규화) → 서치 크롭 좌표계 (x, y, w, h).
+    회귀 헤드가 음수를 낼 수 있으므로 w/h는 크롭 안에서만 클램프.
+    """
+    pred_l, pred_t, pred_r, pred_b = reg_map[0, :, max_y, max_x] * stride
+    px = max_x * stride + stride / 2.0
+    py = max_y * stride + stride / 2.0
+    pred_w = torch.clamp(pred_l + pred_r, min=min_wh, max=search_size).item()
+    pred_h = torch.clamp(pred_t + pred_b, min=min_wh, max=search_size).item()
+    pred_x = (px - pred_l).item()
+    pred_y = (py - pred_t).item()
+    return pred_x, pred_y, pred_w, pred_h
+
 def validate(model: DINOv2, loader: DataLoader, device: torch.device, cfg: TrainConfig):
     model.eval() 
     bce = nn.BCELoss()
-    l1 = nn.SmoothL1Loss()
-    
+    # [deactivated] train과 동일 이유 — 위치별 가중 regression 은 reduction='none' 경로 사용
+    # l1 = nn.SmoothL1Loss()
+
     val_loss = 0.0
     val_iou = 0.0
     steps = 0
@@ -331,7 +357,9 @@ def validate(model: DINOv2, loader: DataLoader, device: torch.device, cfg: Train
             
             # Loss 계산
             loss_cls = bce(score_map, cls_tgt)
-            loss_reg = (l1(reg_map, reg_tgt) * cls_tgt).mean()
+            reg_err = F.smooth_l1_loss(reg_map, reg_tgt, reduction="none", beta=1.0)
+            loss_reg = (reg_err * cls_tgt).sum() / (cls_tgt.sum() * reg_map.shape[1] + 1e-6)
+            # [deactivated] loss_reg = (l1(reg_map, reg_tgt) * cls_tgt).mean()
             loss = loss_cls + 5.0 * loss_reg 
             val_loss += loss.item()
             
@@ -341,16 +369,7 @@ def validate(model: DINOv2, loader: DataLoader, device: torch.device, cfg: Train
             max_y = (max_idx // w).item()
             max_x = (max_idx % w).item()
 
-            pred_l, pred_t, pred_r, pred_b = reg_map[0, :, max_y, max_x] * 14.0
-
-            px = max_x * 14.0 + 7.0
-            py = max_y * 14.0 + 7.0
-
-            pred_x = (px - pred_l).item()
-            pred_y = (py - pred_t).item()
-            pred_w = (pred_l + pred_r).item()
-            pred_h = (pred_t + pred_b).item()
-            
+            pred_x, pred_y, pred_w, pred_h = decode_bbox_in_search_crop(reg_map, max_y, max_x)
             pred_box = [pred_x, pred_y, pred_w, pred_h]
             
             # IoU 계산하기 +
@@ -536,15 +555,9 @@ def run_real_inference():
                 max_y = (max_idx // w_sz).item()
                 max_x = (max_idx % w_sz).item()
 
-                pred_l, pred_t, pred_r, pred_b = reg_map[0, :, max_y, max_x] * 14.0
-                px = max_x * 14.0 + 7.0
-                py = max_y * 14.0 + 7.0
-
-                pred_w = (pred_l + pred_r).item()
-                pred_h = (pred_t + pred_b).item()
-                pred_x_crop = (px - pred_l).item()
-                pred_y_crop = (py - pred_t).item()
-                
+                pred_x_crop, pred_y_crop, pred_w, pred_h = decode_bbox_in_search_crop(
+                    reg_map, max_y, max_x
+                )
                 pred_box_crop = [pred_x_crop, pred_y_crop, pred_w, pred_h]
                 
                 # 224x224 좌표를 원본 영상 좌표로 변환
@@ -576,8 +589,9 @@ def run_real_inference():
     out.release()
     print(f"Tracking finished.. Video Saved in : {out_video_path}")
 
-if __name__ == "__main__":
-    run_real_inference()
+# [deactivated] 학습만 돌릴 때는 아래 블록 비활성화 — __main__ 이 여러 개면 train 직후 추론이 연속 실행됨
+# if __name__ == "__main__":
+#     run_real_inference()
 
 
 
@@ -587,146 +601,117 @@ if __name__ == "__main__":
 
 
 
-import os
-import cv2
-import torch
-import numpy as np
-import json
-import torchvision.transforms as T
-from tqdm import tqdm 
-from network_colab import DINOv2, TypeEmbedding, LoRAConfig
-
-def map_crop_to_original(pred_box_crop: List[float], orig_prev_bbox: List[float]) -> List[float]:
-    px, py, pw, ph = pred_box_crop
-    x, y, w, h = orig_prev_bbox
-    
-    orig_cx = x + w / 2.0
-    orig_cy = y + h / 2.0
-    
-    context = 0.5
-    p = (w + h) / 2.0 * context
-    s_z = float(np.sqrt(max(0.0, (w + p) * (h + p))))
-    s_x = max(16.0, s_z * 2.0)
-    
-    scale = s_x / 224.0
-    
-    orig_pred_x = orig_cx + (px - 112.0) * scale
-    orig_pred_y = orig_cy + (py - 112.0) * scale
-    orig_pred_w = pw * scale
-    orig_pred_h = ph * scale
-    
-    return [orig_pred_x, orig_pred_y, orig_pred_w, orig_pred_h]
-
-def run_real_inference():
-    device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
-    print(f" 현재 장치: {device} ", flush=True)
-    
-    ckpt_path = "/content/ckpt/best_MemLoTrack.pt"
-    
-    print("weight 불러오는 중..", flush=True)
-    model = DINOv2(TypeEmbedding(), LoRAConfig)
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval() 
-    print("weight 전이 완료", flush=True)
-
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    test_base_dir = "/content/data/Anti-UAV410/test"
-    video_folders = sorted([f for f in os.listdir(test_base_dir) if os.path.isdir(os.path.join(test_base_dir, f))])
-    if not video_folders:
-        raise FileNotFoundError("테스트 비디오 폴더가 없습니다!")
-        
-    test_video_dir = os.path.join(test_base_dir, video_folders[0])
-    print(f"Inference 용 비디오: {test_video_dir}", flush=True)
-    
-    img_names = sorted([p for p in os.listdir(test_video_dir) if p.endswith(('.jpg', '.png'))])
-    img_paths = [os.path.join(test_video_dir, p) for p in img_names]
-    
-    with open(os.path.join(test_video_dir, "IR_label.json"), "r") as f:
-        labels = json.load(f)
-    gt_rects = labels['gt_rect']
-    exists = labels['exist']
-
-    sample_frame = cv2.imread(img_paths[11])
-    h, w, _ = sample_frame.shape
-    out_video_path = "/content/tracking_result_SUCCESS.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_video_path, fourcc, 30.0, (w, h))
-    
-    template_tensor = None
-    mem_imgs = []
-    prev_bbox = None
-    l_mem = 7 
-
-    pbar = tqdm(enumerate(img_paths), total=len(img_paths), desc="비디오 추적 중")
-    
-    with torch.no_grad():
-        for i, img_path in pbar:
-            frame = cv2.imread(img_path)
-            
-            if i == 0:
-                prev_bbox = gt_rects[0]
-                template_tensor = make_template_and_search(frame, prev_bbox, transform, is_search=False).to(device)
-                first_mem = make_template_and_search(frame, prev_bbox, transform, is_search=True).squeeze(0)
-                mem_imgs = [first_mem] * l_mem
-                curr_bbox = prev_bbox
-                
-            else:
-                search_tensor = make_template_and_search(frame, prev_bbox, transform, is_search=True).to(device)
-                
-                mem_stack = torch.stack(mem_imgs, dim=0).unsqueeze(0).to(device) 
-                B, L, C, H, W = mem_stack.shape
-                mem_tokens = model.type_embedder(model.get_initial_tokens(mem_stack.view(B*L, C, H, W)), token_type="memory")
-                mem_tokens = mem_tokens.reshape(B, L * mem_tokens.shape[1], mem_tokens.shape[2])
-                
-                target_mask = torch.ones((1, 64), dtype=torch.float32).to(device)
-                
-                score_map, reg_map = model(template_tensor, search_tensor, target_mask, memory_kv=mem_tokens)
-                
-                b_sz, c_sz, h_sz, w_sz = score_map.shape
-                scores_flat = score_map.view(b_sz, -1)
-                max_idx = torch.argmax(scores_flat, dim=1)
-                max_y = (max_idx // w_sz).item()
-                max_x = (max_idx % w_sz).item()
-
-                pred_l, pred_t, pred_r, pred_b = reg_map[0, :, max_y, max_x] * 14.0
-                px = max_x * 14.0 + 7.0
-                py = max_y * 14.0 + 7.0
-
-                pred_w = (pred_l + pred_r).item()
-                pred_h = (pred_t + pred_b).item()
-                pred_x_crop = (px - pred_l).item()
-                pred_y_crop = (py - pred_t).item()
-                
-                pred_box_crop = [pred_x_crop, pred_y_crop, pred_w, pred_h]
-                curr_bbox = map_crop_to_original(pred_box_crop, prev_bbox)
-                
-                prev_bbox = curr_bbox
-                
-                curr_mem_patch = make_template_and_search(frame, curr_bbox, transform, is_search=True).squeeze(0)
-                mem_imgs.pop(0)
-                mem_imgs.append(curr_mem_patch)
-
-            if curr_bbox is not None and sum(curr_bbox) > 0:
-                bx, by, bw, bh = [int(v) for v in curr_bbox]
-                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
-            
-            if exists[i] == 1:
-                gx, gy, gw, gh = [int(v) for v in gt_rects[i]]
-                cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), (0, 255, 0), 2)
-            
-            out.write(frame)
-
-    out.release()
-    print(f"\nTracking Finished .. Video Saved in : {out_video_path}")
-
-if __name__ == "__main__":
-    run_real_inference()
+# --- [deactivated] 파일 상단 map_crop_to_original / run_real_inference 와 중복.
+# 로드 시 뒤쪽 정의가 앞쪽을 덮어써 혼란·이중 실행 유발 → 전체 주석 처리 (필요 시 # 제거)
+# import os
+# import cv2
+# import torch
+# import numpy as np
+# import json
+# import torchvision.transforms as T
+# from tqdm import tqdm
+# from network_colab import DINOv2, TypeEmbedding, LoRAConfig
+#
+# def map_crop_to_original(pred_box_crop: List[float], orig_prev_bbox: List[float]) -> List[float]:
+#     px, py, pw, ph = pred_box_crop
+#     x, y, w, h = orig_prev_bbox
+#     orig_cx = x + w / 2.0
+#     orig_cy = y + h / 2.0
+#     context = 0.5
+#     p = (w + h) / 2.0 * context
+#     s_z = float(np.sqrt(max(0.0, (w + p) * (h + p))))
+#     s_x = max(16.0, s_z * 2.0)
+#     scale = s_x / 224.0
+#     orig_pred_x = orig_cx + (px - 112.0) * scale
+#     orig_pred_y = orig_cy + (py - 112.0) * scale
+#     orig_pred_w = pw * scale
+#     orig_pred_h = ph * scale
+#     return [orig_pred_x, orig_pred_y, orig_pred_w, orig_pred_h]
+#
+# def run_real_inference():
+#     device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
+#     print(f" 현재 장치: {device} ", flush=True)
+#     ckpt_path = "/content/ckpt/best_MemLoTrack.pt"
+#     print("weight 불러오는 중..", flush=True)
+#     model = DINOv2(TypeEmbedding(), LoRAConfig)
+#     checkpoint = torch.load(ckpt_path, map_location=device)
+#     model.load_state_dict(checkpoint['model_state_dict'])
+#     model.to(device)
+#     model.eval()
+#     print("weight 전이 완료", flush=True)
+#     transform = T.Compose([
+#         T.ToTensor(),
+#         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+#     ])
+#     test_base_dir = "/content/data/Anti-UAV410/test"
+#     video_folders = sorted([f for f in os.listdir(test_base_dir) if os.path.isdir(os.path.join(test_base_dir, f))])
+#     if not video_folders:
+#         raise FileNotFoundError("테스트 비디오 폴더가 없습니다!")
+#     test_video_dir = os.path.join(test_base_dir, video_folders[0])
+#     print(f"Inference 용 비디오: {test_video_dir}", flush=True)
+#     img_names = sorted([p for p in os.listdir(test_video_dir) if p.endswith(('.jpg', '.png'))])
+#     img_paths = [os.path.join(test_video_dir, p) for p in img_names]
+#     with open(os.path.join(test_video_dir, "IR_label.json"), "r") as f:
+#         labels = json.load(f)
+#     gt_rects = labels['gt_rect']
+#     exists = labels['exist']
+#     sample_frame = cv2.imread(img_paths[11])
+#     h, w, _ = sample_frame.shape
+#     out_video_path = "/content/tracking_result_SUCCESS.mp4"
+#     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+#     out = cv2.VideoWriter(out_video_path, fourcc, 30.0, (w, h))
+#     template_tensor = None
+#     mem_imgs = []
+#     prev_bbox = None
+#     l_mem = 7
+#     pbar = tqdm(enumerate(img_paths), total=len(img_paths), desc="비디오 추적 중")
+#     with torch.no_grad():
+#         for i, img_path in pbar:
+#             frame = cv2.imread(img_path)
+#             if i == 0:
+#                 prev_bbox = gt_rects[0]
+#                 template_tensor = make_template_and_search(frame, prev_bbox, transform, is_search=False).to(device)
+#                 first_mem = make_template_and_search(frame, prev_bbox, transform, is_search=True).squeeze(0)
+#                 mem_imgs = [first_mem] * l_mem
+#                 curr_bbox = prev_bbox
+#             else:
+#                 search_tensor = make_template_and_search(frame, prev_bbox, transform, is_search=True).to(device)
+#                 mem_stack = torch.stack(mem_imgs, dim=0).unsqueeze(0).to(device)
+#                 B, L, C, H, W = mem_stack.shape
+#                 mem_tokens = model.type_embedder(model.get_initial_tokens(mem_stack.view(B*L, C, H, W)), token_type="memory")
+#                 mem_tokens = mem_tokens.reshape(B, L * mem_tokens.shape[1], mem_tokens.shape[2])
+#                 target_mask = torch.ones((1, 64), dtype=torch.float32).to(device)
+#                 score_map, reg_map = model(template_tensor, search_tensor, target_mask, memory_kv=mem_tokens)
+#                 b_sz, c_sz, h_sz, w_sz = score_map.shape
+#                 scores_flat = score_map.view(b_sz, -1)
+#                 max_idx = torch.argmax(scores_flat, dim=1)
+#                 max_y = (max_idx // w_sz).item()
+#                 max_x = (max_idx % w_sz).item()
+#                 pred_l, pred_t, pred_r, pred_b = reg_map[0, :, max_y, max_x] * 14.0
+#                 px = max_x * 14.0 + 7.0
+#                 py = max_y * 14.0 + 7.0
+#                 pred_w = (pred_l + pred_r).item()
+#                 pred_h = (pred_t + pred_b).item()
+#                 pred_x_crop = (px - pred_l).item()
+#                 pred_y_crop = (py - pred_t).item()
+#                 pred_box_crop = [pred_x_crop, pred_y_crop, pred_w, pred_h]
+#                 curr_bbox = map_crop_to_original(pred_box_crop, prev_bbox)
+#                 prev_bbox = curr_bbox
+#                 curr_mem_patch = make_template_and_search(frame, curr_bbox, transform, is_search=True).squeeze(0)
+#                 mem_imgs.pop(0)
+#                 mem_imgs.append(curr_mem_patch)
+#             if curr_bbox is not None and sum(curr_bbox) > 0:
+#                 bx, by, bw, bh = [int(v) for v in curr_bbox]
+#                 cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+#             if exists[i] == 1:
+#                 gx, gy, gw, gh = [int(v) for v in gt_rects[i]]
+#                 cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), (0, 255, 0), 2)
+#             out.write(frame)
+#     out.release()
+#     print(f"\nTracking Finished .. Video Saved in : {out_video_path}")
+#
+# if __name__ == "__main__":
+#     run_real_inference()
 
 
     
