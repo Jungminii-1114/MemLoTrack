@@ -1,3 +1,21 @@
+# MemLoTrack: Enhancing TIR Anti-UAV Tracking with Memory-Integrated Low-Rank Adaptation
+Inspired by the architecture of the paper *"MemLoTrack: Enhancing TIR Anti-UAV Tracking with Memory-Integrated Low-Rank Adaptation"*, this repository shows the overall process of implementing MemLoTrack with DINOv2.
+
+## Key Features
+* **Dual Gating Process of Memory Bank(MB)**
+* **Memory Attention Layer (MAL)**
+* **Inference Pipeline**
+
+## Repository Structure
+
+
+## Project Results (Being Aborted...)
+
+https://github.com/user-attachments/assets/cdbdf280-6250-49f0-95e6-2a5dadf5c2f6
+
+
+
+
 ### `MemEffAttention` Module in DINOv2
 An optimized implementatino of self-attention mechanism designed for memory efficiency.
 particularly beneficial for processing high-resolution images or large batch-size in Computer Vision Tasks.
