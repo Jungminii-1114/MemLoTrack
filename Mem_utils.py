@@ -46,7 +46,6 @@ def SiamFC_crop(img, cx, cy, size, out_size):
     if img is None or img.size == 0:
         return np.zeros((out_size, out_size, 3), dtype=np.uint8)
 
-    # 🛡️ 2차 입구컷: 정답지(좌표)가 썩었으면 까만 화면 반환!
     if np.isnan(cx) or np.isnan(cy) or np.isnan(size):
         return np.zeros((out_size, out_size, 3), dtype=np.uint8)
         
